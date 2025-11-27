@@ -31,6 +31,11 @@ TRANSLATORS = [
         "base_url": "https://api.deepseek.com/v1",
         "api_key": "sk-0f0a93adb7124908a2ecfeccb63b43d8",  # 替换为你的API key
     },
+    {
+        "model_name": "gpt-4o-mini",
+        "base_url": "https://api.modelverse.cn/v1/",
+        "api_key": "gWU4ecFVBoEucRwl4dFe0c13-347D-4eA9-93b7-07306684",
+    },
 ]
 
 # API配置 - 润色模型 (可选，留空则跳过润色阶段)
@@ -67,7 +72,7 @@ from rich.progress import TimeRemainingColumn
 
 from babeldoc.docvision.doclayout import DocLayoutModel
 from babeldoc.format.pdf.high_level import async_translate
-from babeldoc.format.pdf.translation_config import TranslationConfig
+from babeldoc.format.pdf.translation_config import TranslationConfig, WatermarkOutputMode
 from babeldoc.translator.pipeline import (
     ModelConfig,
     ModelType,
@@ -233,6 +238,7 @@ def main():
         output_dir=output_path,
         auto_extract_glossary=False,  # 禁用自动术语提取
         pool_max_workers=MAX_WORKERS,  # 并发数
+        watermark_output_mode=WatermarkOutputMode.NoWatermark,  # 去掉水印
     )
 
     print(f"\n开始翻译...")

@@ -128,9 +128,10 @@ def extract_actual_translation_text(translated_text: str) -> str:
     if not translated_text:
         return ""
 
+    text = translated_text.strip()
+
     # Try to parse as JSON
     try:
-        text = translated_text.strip()
         # Check if it starts with [ (JSON array) or { (JSON object)
         if not text.startswith("[") and not text.startswith("{"):
             return translated_text
@@ -163,8 +164,37 @@ def extract_actual_translation_text(translated_text: str) -> str:
             if outputs:
                 return " ".join(outputs)
 
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-        pass
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+        logger.debug(f"Failed to parse JSON in extract_actual_translation_text: {e}")
+
+    # If JSON parsing succeeded but no output found, or parsing failed,
+    # try a regex-based extraction as fallback
+    try:
+        # Try to extract "output" values using regex
+        # This handles cases where json.loads failed or structure was unexpected
+        # Pattern matches both "output": "..." and 'output': '...'
+        output_pattern = r'["\']output["\']\s*:\s*"((?:[^"\\]|\\.)*)"|["\']output["\']\s*:\s*\'((?:[^\'\\]|\\.)*)\''
+        matches = re.findall(output_pattern, text)
+        if matches:
+            outputs = []
+            for match in matches:
+                # match is a tuple (double_quoted, single_quoted)
+                output_text = match[0] if match[0] else match[1]
+                # Unescape JSON string
+                try:
+                    output_text = json.loads(f'"{output_text}"')
+                except json.JSONDecodeError:
+                    pass
+                # Remove style tags for cleaner display
+                clean_text = re.sub(r"<style[^>]*>|</style>", "", output_text)
+                # Remove placeholders like {v3}
+                clean_text = re.sub(r"\{v\d+\}", "", clean_text)
+                if clean_text.strip():
+                    outputs.append(clean_text.strip())
+            if outputs:
+                return " ".join(outputs)
+    except Exception as e:
+        logger.debug(f"Regex fallback failed in extract_actual_translation_text: {e}")
 
     return translated_text
 
@@ -246,9 +276,9 @@ def _aggregate_model_scores(data: PipelineProcessData) -> dict[str, dict[str, An
     Aggregate evaluation scores by target model.
 
     Returns:
-        {target_model: {'type': 'Translator'|'Polisher', 'scores': EvaluationScores}}
+        {display_name: {'type': 'Translator'|'Polisher', 'scores': EvaluationScores}}
     """
-    # Structure: {target_model: {'type': str, 'dims': {dim: [scores]}}}
+    # Structure: {display_name: {'type': str, 'dims': {dim: [scores]}}}
     raw_data: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"type": "", "dims": defaultdict(list)}
     )
@@ -259,12 +289,25 @@ def _aggregate_model_scores(data: PipelineProcessData) -> dict[str, dict[str, An
                 target = ev.target_model
                 # Determine type from target_type
                 model_type = "Translator" if ev.target_type == "translator" else "Polisher"
-                raw_data[target]["type"] = model_type
-                raw_data[target]["dims"]["accuracy"].append(ev.scores.accuracy)
-                raw_data[target]["dims"]["fluency"].append(ev.scores.fluency)
-                raw_data[target]["dims"]["consistency"].append(ev.scores.consistency)
-                raw_data[target]["dims"]["terminology"].append(ev.scores.terminology)
-                raw_data[target]["dims"]["completeness"].append(ev.scores.completeness)
+
+                # Convert unique ID to display name
+                # "translator:gpt-4o-mini" -> "gpt-4o-mini"
+                # "polisher:deepseek-chat+gpt-4o-mini" -> "deepseek-chat→gpt-4o-mini"
+                if target.startswith("translator:"):
+                    display_name = target[len("translator:"):]
+                elif target.startswith("polisher:"):
+                    # Remove prefix and convert + to →
+                    display_name = target[len("polisher:"):].replace("+", "→")
+                else:
+                    # Fallback for old format
+                    display_name = target
+
+                raw_data[display_name]["type"] = model_type
+                raw_data[display_name]["dims"]["accuracy"].append(ev.scores.accuracy)
+                raw_data[display_name]["dims"]["fluency"].append(ev.scores.fluency)
+                raw_data[display_name]["dims"]["consistency"].append(ev.scores.consistency)
+                raw_data[display_name]["dims"]["terminology"].append(ev.scores.terminology)
+                raw_data[display_name]["dims"]["completeness"].append(ev.scores.completeness)
 
     # Calculate averages
     result: dict[str, dict[str, Any]] = {}
@@ -282,11 +325,35 @@ def _aggregate_model_scores(data: PipelineProcessData) -> dict[str, dict[str, An
     return result
 
 
+def _ensure_clean_translation(text: str) -> str:
+    """
+    Ensure translation text is clean for display.
+
+    If the text still looks like JSON (starts with [ or {), try to extract
+    the actual translation again. This is a safeguard for cases where
+    the initial extraction failed.
+    """
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    # If it looks like JSON, try to extract again
+    if text.startswith("[") or text.startswith("{"):
+        extracted = extract_actual_translation_text(text)
+        # Only use extracted if it's different and not still JSON
+        if extracted != text and not extracted.strip().startswith("[") and not extracted.strip().startswith("{"):
+            return extracted
+
+    return text
+
+
 def _collect_model_results(para) -> list[dict[str, Any]]:
     """Collect translation/polish results with their scores for a paragraph."""
     results = []
 
     # Get evaluation scores for each model
+    # The key is the unique ID used in evaluation (e.g., "translator:gpt-4o-mini")
     model_scores: dict[str, float] = {}
     for ev in para.evaluations:
         if ev.scores:
@@ -295,21 +362,31 @@ def _collect_model_results(para) -> list[dict[str, Any]]:
     # Add translations
     for trans in para.translations:
         if trans.processed_text:
+            # Match the unique ID format used in evaluation
+            unique_id = f"translator:{trans.model_name}"
+            # Ensure clean translation text for display
+            clean_translation = _ensure_clean_translation(trans.processed_text)
             results.append({
                 "model": trans.model_name,
                 "role": "Translator",
-                "translation": trans.processed_text,
-                "score": model_scores.get(trans.model_name, 0),
+                "translation": clean_translation,
+                "score": model_scores.get(unique_id, model_scores.get(trans.model_name, 0)),
             })
 
-    # Add polishes
+    # Add polishes - each polish comes from a specific translator
     for polish in para.polishes:
         if polish.processed_text:
+            # Match the unique ID format used in evaluation
+            unique_id = f"polisher:{polish.from_translator}+{polish.model_name}"
+            # Display name shows the translation source
+            display_name = f"{polish.from_translator}→{polish.model_name}"
+            # Ensure clean translation text for display
+            clean_translation = _ensure_clean_translation(polish.processed_text)
             results.append({
-                "model": polish.model_name,
+                "model": display_name,
                 "role": "Polisher",
-                "translation": polish.processed_text,
-                "score": model_scores.get(polish.model_name, 0),
+                "translation": clean_translation,
+                "score": model_scores.get(unique_id, model_scores.get(polish.model_name, 0)),
             })
 
     return results

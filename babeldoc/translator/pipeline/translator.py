@@ -169,6 +169,10 @@ class PipelineTranslator(BaseTranslator):
         # key: paragraph.debug_id, value: translate_input
         self._pipeline_translate_inputs: dict[str, Any] = {}
 
+        # 用于临时存储最新一批翻译的所有结果（多翻译模型时）
+        # 在 do_llm_translate 中设置，在 _record_translation_for_batch 中使用后清空
+        self._latest_translations: list[TranslationResult] | None = None
+
         logger.info(
             f"PipelineTranslator initialized with "
             f"{len(self.translator_clients)} translators, "
@@ -210,7 +214,11 @@ class PipelineTranslator(BaseTranslator):
         translated_text: str,
         batch_id_to_debug_id: dict[int, str] | None = None,
     ) -> None:
-        """Record a translation result for batch processing (polish/evaluation)."""
+        """Record all translation results for batch processing (polish/evaluation).
+
+        When multiple translators are configured, this method records ALL translation
+        results from _latest_translations, not just the one returned to ILTranslatorLLMOnly.
+        """
         if not self._batch_mode:
             return
 
@@ -220,11 +228,11 @@ class PipelineTranslator(BaseTranslator):
         with self._lock:
             self._paragraph_counter += 1
             paragraph_id = f"p_{self._paragraph_counter}"
+            # Get all translations from the latest run
+            latest_translations = getattr(self, '_latest_translations', None)
 
         # 提取实际的源文本（去掉 prompt 包装）用于显示和评估
         actual_source = extract_actual_source_text(source_text)
-        # 提取实际的翻译文本（去掉 JSON 格式）用于显示和评估
-        actual_translation = extract_actual_translation_text(translated_text)
 
         # Create paragraph process data
         para_data = ParagraphProcessData(
@@ -236,37 +244,50 @@ class PipelineTranslator(BaseTranslator):
         if batch_id_to_debug_id:
             para_data.batch_id_to_debug_id = batch_id_to_debug_id
 
-        # 查找实际使用的模型名称
-        model_name = self._translation_model_map.get(translated_text)
-        if model_name is None:
-            model_name = (
-                self.translator_clients[0].config.model_name
-                if self.translator_clients
-                else "unknown"
-            )
+        # Record all translation results from all configured translators
+        translation_results: list[TranslationResult] = []
 
-        # Create a TranslationResult
-        # 存储提取后的文本用于显示/评估，以及原始 JSON 用于 IL 文档更新
-        # 去除 markdown 代码块格式
-        raw_json = strip_markdown_code_block(translated_text)
-        translation_result = TranslationResult(
-            model_name=model_name,
-            source_text=actual_source,
-            processed_text=actual_translation,
-            raw_json=raw_json,
-        )
-        para_data.translations = [translation_result]
+        if latest_translations:
+            # Use all translations from the multi-model run
+            for t in latest_translations:
+                if t.processed_text:
+                    translation_results.append(t)
+            logger.info(f"[Pipeline] 段落 {paragraph_id}: 记录 {len(translation_results)} 个翻译结果 "
+                       f"(模型: {[t.model_name for t in translation_results]})")
+        else:
+            # Fallback: single translation (cache hit or single translator)
+            model_name = self._translation_model_map.get(translated_text)
+            if model_name is None:
+                model_name = (
+                    self.translator_clients[0].config.model_name
+                    if self.translator_clients
+                    else "unknown"
+                )
+            raw_json = strip_markdown_code_block(translated_text)
+            actual_translation = extract_actual_translation_text(translated_text)
+            translation_results.append(TranslationResult(
+                model_name=model_name,
+                source_text=actual_source,
+                processed_text=actual_translation,
+                raw_json=raw_json,
+            ))
 
-        # 默认选择翻译结果
-        para_data.selected_result = actual_translation
-        para_data.selected_model = model_name
-        para_data.selected_type = "translator"
-        para_data.selected_raw_text = raw_json  # 默认使用翻译器的原始 JSON（已去除 markdown 代码块）
+        para_data.translations = translation_results
+
+        # 默认选择第一个翻译结果
+        if translation_results:
+            first = translation_results[0]
+            para_data.selected_result = first.processed_text
+            para_data.selected_model = first.model_name
+            para_data.selected_type = "translator"
+            para_data.selected_raw_text = first.raw_json
 
         with self._lock:
             self._pending_paragraphs.append(para_data)
             self._process_data.paragraphs.append(para_data)
             self._process_data.total_paragraphs += 1
+            # Clear latest translations for next batch
+            self._latest_translations = None
 
         logger.debug(f"[Pipeline] 段落 {paragraph_id}: 记录翻译结果 (待批量润色/评估)")
 
@@ -276,12 +297,17 @@ class PipelineTranslator(BaseTranslator):
 
         Note: This method is called by BaseTranslator.llm_translate() when cache misses.
         The batch processing recording is handled in llm_translate() override, not here.
+
+        When multiple translators are configured, all translators run in parallel.
+        All translation results are stored for later polish/evaluation stages.
+        Only the first successful result is returned (for IL document update).
         """
         if text is None:
             return None
 
         # Run translation with all translator models
-        logger.debug(f"[Pipeline] do_llm_translate: running translation for text length {len(text)}")
+        logger.info(f"[Pipeline] do_llm_translate: running translation with "
+                   f"{len(self.translator_clients)} translator(s)")
         translations = self._run_translations(text)
 
         # Update token counts for translations
@@ -289,15 +315,24 @@ class PipelineTranslator(BaseTranslator):
             for t in translations:
                 self._process_data.add_token_usage(t.model_name, t.token_usage)
 
-        # Return the first successful translation result and track its model
-        for t in translations:
-            if t.processed_text:
-                # 记录这个翻译结果对应的模型名称（用 raw_json 作为 key）
-                with self._lock:
+        # Store all successful translations for later batch processing
+        # The first successful result will be returned for IL document update
+        first_result = None
+        with self._lock:
+            for t in translations:
+                if t.processed_text:
+                    # 记录这个翻译结果对应的模型名称（用 raw_json 作为 key）
                     self._translation_model_map[t.raw_json] = t.model_name
-                return t.raw_json  # 返回原始 JSON 用于 IL 文档更新
+                    logger.info(f"[Pipeline] Translation from {t.model_name}: "
+                               f"{t.processed_text[:100]}...")
+                    if first_result is None:
+                        first_result = t.raw_json
 
-        return ""
+            # Store all translations for batch processing
+            # This will be picked up by _record_translation_for_batch
+            self._latest_translations = translations
+
+        return first_result if first_result else ""
 
     def _process_paragraph_full(
         self,
@@ -447,7 +482,7 @@ class PipelineTranslator(BaseTranslator):
             import threading as _threading
             start_time = _time.time()
             thread_id = _threading.current_thread().name
-            print(f"polish_single: {thread_id}")
+            # print(f"polish_single: {thread_id}")
             # 润色时传入翻译器返回的原始 JSON
             input_json = trans.raw_json if trans.raw_json else trans.processed_text
             messages = [
@@ -571,23 +606,28 @@ class PipelineTranslator(BaseTranslator):
             thread_id = _threading.current_thread().name
 
             # 收集所有候选翻译
+            # 使用唯一 ID 来避免相同模型名称的冲突
             candidates: list[dict[str, str]] = []
 
-            # 添加翻译结果
+            # 添加翻译结果 - 使用 "translator:{model_name}" 格式
             for trans in para_data.translations:
                 if trans.processed_text:
+                    unique_id = f"translator:{trans.model_name}"
                     candidates.append({
-                        "model_id": trans.model_name,
+                        "model_id": unique_id,
+                        "display_name": trans.model_name,  # 用于报告显示
                         "type": "translator",
                         "translation": trans.processed_text,  # 用于显示和评估
                         "raw_json": trans.raw_json,  # 翻译器返回的原始 JSON
                     })
 
-            # 添加润色结果
+            # 添加润色结果 - 使用 "polisher:{from_translator}+{polisher_model}" 格式
             for polish in para_data.polishes:
                 if polish.processed_text:
+                    unique_id = f"polisher:{polish.from_translator}+{polish.model_name}"
                     candidates.append({
-                        "model_id": polish.model_name,
+                        "model_id": unique_id,
+                        "display_name": f"{polish.from_translator}+{polish.model_name}",  # 用于报告显示
                         "type": "polisher",
                         "translation": polish.processed_text,  # 用于显示和评估
                         "raw_json": polish.raw_json,  # 润色器返回的原始 JSON
@@ -596,7 +636,7 @@ class PipelineTranslator(BaseTranslator):
             if not candidates:
                 return para_data.paragraph_id, []
 
-            print(f"[Pipeline] 开始对比评估: {para_data.paragraph_id}, evaluator={client.config.model_name}, 候选数={len(candidates)}, thread={thread_id}", flush=True)
+            # print(f"[Pipeline] 开始对比评估: {para_data.paragraph_id}, evaluator={client.config.model_name}, 候选数={len(candidates)}, thread={thread_id}", flush=True)
 
             # 构建对比评估的 prompt
             candidates_text = ""
@@ -740,18 +780,21 @@ class PipelineTranslator(BaseTranslator):
             para_data.evaluations = para_evaluations[para_data.paragraph_id]
 
     def _run_translations(self, text: str) -> list[TranslationResult]:
-        """Run translation with all translator models in parallel."""
+        """Run translation with all translator models in parallel.
+
+        When used with ILTranslatorLLMOnly, the text parameter is already a complete
+        prompt built by _build_llm_prompt, containing role instructions, contextual hints,
+        glossary tables, and JSON input format. We should use it directly as the user message.
+        """
         results: list[TranslationResult] = []
 
         if not self.translator_clients:
             return results
 
         def translate_with_model(client: ModelClient) -> TranslationResult:
+            # The text from ILTranslatorLLMOnly already contains the complete prompt
+            # with all instructions, so we use it directly as user content
             messages = [
-                {
-                    "role": "system",
-                    "content": f"You are a professional translator. Translate the following text from {self.lang_in} to {self.lang_out}. Output ONLY the translation.",
-                },
                 {"role": "user", "content": text},
             ]
             try:
