@@ -76,6 +76,8 @@ TRANSLATE_STAGES = [
     # (RemoveDescent.stage_name, 0.15),  # Remove Char Descent
     (AutomaticTermExtractor.stage_name, 30.0),  # Extract Terms
     (ILTranslator.stage_name, 46.96),  # Translate Paragraphs
+    ("Polish Translations", 15.0),  # Pipeline: Polish Translations
+    ("Evaluate Translations", 15.0),  # Pipeline: Evaluate Translations
     (Typesetting.stage_name, 4.71),  # Typesetting
     (FontMapper.stage_name, 0.61),  # Add Fonts
     (PDFCreater.stage_name, 1.96),  # Generate drawing instructions
@@ -1073,8 +1075,23 @@ def _do_translate_single(
             il_translator = ILTranslator(translate_engine, translation_config)
 
         il_translator.translate(docs)
-        del il_translator
         logger.debug(f"finish ILTranslator from {temp_pdf_path}")
+
+        # Pipeline 模式：翻译完成后执行批量润色和评估
+        if hasattr(translate_engine, "finalize_batch"):
+            logger.info("Pipeline mode: running batch polish and evaluation...")
+            # 传递 progress_monitor 和 pool_max_workers 以显示润色和评估进度并控制并发
+            translate_engine.finalize_batch(
+                progress_monitor=translation_config.progress_monitor,
+                pool_max_workers=translation_config.pool_max_workers,
+            )
+            # 更新 docs 中的翻译结果为最佳结果
+            # 传递 il_translator 以便重新解析润色后的文本
+            if hasattr(translate_engine, "update_docs_with_best_results"):
+                translate_engine.update_docs_with_best_results(docs, il_translator)
+            logger.info("Pipeline mode: batch processing completed")
+
+        del il_translator
     else:
         logger.info("skip ILTranslator")
 

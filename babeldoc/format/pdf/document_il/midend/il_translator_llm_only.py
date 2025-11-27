@@ -664,19 +664,28 @@ class ILTranslatorLLMOnly:
                     )
                 )
                 paragraph_unicodes.append(paragraph.unicode)
+                # 保存 translate_input 到翻译引擎，供后续润色更新使用
+                # 使用段落的 debug_id 作为键
+                if hasattr(self.translate_engine, '_pipeline_translate_inputs'):
+                    self.translate_engine._pipeline_translate_inputs[paragraph.debug_id] = translate_input
             if not inputs:
                 return
             json_format_input = []
 
+            # 记录本批次内 id 到 debug_id 的映射，供后续润色更新使用
+            batch_id_to_debug_id = {}
             for id_, input_text in enumerate(inputs):
                 ti: il_translator.ILTranslator.TranslateInput = input_text[1]
                 tracker: ParagraphTranslateTracker = input_text[3]
+                paragraph = input_text[2]
                 tracker.record_multi_paragraph_index(id_)
+                # 记录映射
+                batch_id_to_debug_id[id_] = paragraph.debug_id
                 placeholders_hint = ti.get_placeholders_hint()
                 obj = {
                     "id": id_,
                     "input": input_text[0],
-                    "layout_label": input_text[2].layout_label,
+                    "layout_label": paragraph.layout_label,
                 }
                 if (
                     placeholders_hint
@@ -707,6 +716,8 @@ class ILTranslatorLLMOnly:
                 rate_limit_params={
                     "paragraph_token_count": paragraph_token_count,
                     "request_json_mode": True,
+                    # 传递 id 到 debug_id 的映射，供 pipeline 使用
+                    "batch_id_to_debug_id": batch_id_to_debug_id,
                 },
             )
             for llm_translate_tracker in llm_translate_trackers:
