@@ -53,3 +53,6 @@ prd/
 examples/ci/test.pdf
 
 output/
+run_pipeline.sh
+
+examples/docs

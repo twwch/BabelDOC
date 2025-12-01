@@ -13,10 +13,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from babeldoc.translator.pipeline.models import (
-    EvaluationScores,
-    PipelineProcessData,
-)
+from babeldoc.translator.pipeline.models import EvaluationScores
+from babeldoc.translator.pipeline.models import PipelineProcessData
 
 logger = logging.getLogger(__name__)
 
@@ -54,66 +52,83 @@ def extract_actual_source_text(source_text: str) -> str:
     """
     Extract actual source text from the full prompt format.
 
-    The source_text might be a full prompt containing "## Here is the input:" followed
-    by a JSON array with "input" fields. This function extracts and concatenates
-    the actual source texts.
+    The source_text might be a full prompt in one of these formats:
+    1. Contains "## Here is the input:" followed by a JSON array with "input" fields
+    2. Contains "Now translate the following text:" followed by the actual text
+    3. Starts with "You are a professional" (translation prompt)
+
+    This function extracts and returns the actual source texts.
     """
     if not source_text:
         return ""
 
-    # Check if this looks like a prompt (contains the marker)
-    marker = "## Here is the input:"
-    if marker not in source_text:
-        # Return as-is if it doesn't look like a prompt
-        return source_text
+    # Format 1: "## Here is the input:" with JSON array
+    marker1 = "## Here is the input:"
+    if marker1 in source_text:
+        try:
+            json_start = source_text.find(marker1)
+            json_part = source_text[json_start + len(marker1):].strip()
 
-    # Find the JSON array after the marker
-    try:
-        json_start = source_text.find(marker)
-        if json_start == -1:
-            return source_text
+            # Find the JSON array
+            array_start = json_part.find("[")
+            if array_start != -1:
+                # Find the matching closing bracket
+                bracket_count = 0
+                array_end = -1
+                for i, char in enumerate(json_part[array_start:], start=array_start):
+                    if char == "[":
+                        bracket_count += 1
+                    elif char == "]":
+                        bracket_count -= 1
+                        if bracket_count == 0:
+                            array_end = i + 1
+                            break
 
-        json_part = source_text[json_start + len(marker):].strip()
+                if array_end != -1:
+                    json_array_str = json_part[array_start:array_end]
+                    data = json.loads(json_array_str)
 
-        # Find the JSON array
-        array_start = json_part.find("[")
-        if array_start == -1:
-            return source_text
+                    # Extract "input" fields from each item
+                    inputs = []
+                    for item in data:
+                        if isinstance(item, dict) and "input" in item:
+                            input_text = item["input"]
+                            # Remove style tags for cleaner display
+                            clean_text = re.sub(r"<style[^>]*>|</style>", "", input_text)
+                            # Remove placeholders like {v3}
+                            clean_text = re.sub(r"\{v\d+\}", "", clean_text)
+                            inputs.append(clean_text.strip())
 
-        # Find the matching closing bracket
-        bracket_count = 0
-        array_end = -1
-        for i, char in enumerate(json_part[array_start:], start=array_start):
-            if char == "[":
-                bracket_count += 1
-            elif char == "]":
-                bracket_count -= 1
-                if bracket_count == 0:
-                    array_end = i + 1
-                    break
+                    if inputs:
+                        return " ".join(inputs)
 
-        if array_end == -1:
-            return source_text
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            pass
 
-        json_array_str = json_part[array_start:array_end]
-        data = json.loads(json_array_str)
+    # Format 2: "Now translate the following text:" marker
+    marker2 = "Now translate the following text:"
+    if marker2 in source_text:
+        idx = source_text.find(marker2)
+        actual_text = source_text[idx + len(marker2):].strip()
+        if actual_text:
+            return actual_text
 
-        # Extract "input" fields from each item
-        inputs = []
-        for item in data:
-            if isinstance(item, dict) and "input" in item:
-                input_text = item["input"]
-                # Remove style tags for cleaner display
-                clean_text = re.sub(r"<style[^>]*>|</style>", "", input_text)
-                # Remove placeholders like {v3}
-                clean_text = re.sub(r"\{v\d+\}", "", clean_text)
-                inputs.append(clean_text.strip())
+    # Format 3: Check if it looks like a translation prompt (starts with role description)
+    # This catches prompts that start with "You are a professional..."
+    if source_text.strip().startswith("You are a professional"):
+        # Try to find the text after "## Output" section
+        output_marker = "## Output"
+        if output_marker in source_text:
+            # Look for text after the output instructions
+            output_idx = source_text.find(output_marker)
+            after_output = source_text[output_idx:]
 
-        if inputs:
-            return " ".join(inputs)
-
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-        pass
+            # Find "Now translate the following text:" after ## Output
+            if marker2 in after_output:
+                translate_idx = after_output.find(marker2)
+                actual_text = after_output[translate_idx + len(marker2):].strip()
+                if actual_text:
+                    return actual_text
 
     return source_text
 
@@ -271,9 +286,16 @@ def _score_color(score: float) -> str:
         return "#dc3545"  # Red
 
 
-def _aggregate_model_scores(data: PipelineProcessData) -> dict[str, dict[str, Any]]:
+def _aggregate_model_scores(
+    data: PipelineProcessData,
+    model_mapping: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
     """
     Aggregate evaluation scores by target model.
+
+    Args:
+        data: Pipeline process data
+        model_mapping: Optional mapping from model names to aliases for anonymization
 
     Returns:
         {display_name: {'type': 'Translator'|'Polisher', 'scores': EvaluationScores}}
@@ -301,6 +323,10 @@ def _aggregate_model_scores(data: PipelineProcessData) -> dict[str, dict[str, An
                 else:
                     # Fallback for old format
                     display_name = target
+
+                # Anonymize if mapping provided
+                if model_mapping:
+                    display_name = _anonymize_model_name(display_name, model_mapping)
 
                 raw_data[display_name]["type"] = model_type
                 raw_data[display_name]["dims"]["accuracy"].append(ev.scores.accuracy)
@@ -348,7 +374,10 @@ def _ensure_clean_translation(text: str) -> str:
     return text
 
 
-def _collect_model_results(para) -> list[dict[str, Any]]:
+def _collect_model_results(
+    para,
+    model_mapping: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Collect translation/polish results with their scores for a paragraph."""
     results = []
 
@@ -366,8 +395,12 @@ def _collect_model_results(para) -> list[dict[str, Any]]:
             unique_id = f"translator:{trans.model_name}"
             # Ensure clean translation text for display
             clean_translation = _ensure_clean_translation(trans.processed_text)
+            # Anonymize model name if mapping provided
+            display_name = trans.model_name
+            if model_mapping:
+                display_name = _anonymize_model_name(display_name, model_mapping)
             results.append({
-                "model": trans.model_name,
+                "model": display_name,
                 "role": "Translator",
                 "translation": clean_translation,
                 "score": model_scores.get(unique_id, model_scores.get(trans.model_name, 0)),
@@ -380,6 +413,9 @@ def _collect_model_results(para) -> list[dict[str, Any]]:
             unique_id = f"polisher:{polish.from_translator}+{polish.model_name}"
             # Display name shows the translation source
             display_name = f"{polish.from_translator}→{polish.model_name}"
+            # Anonymize if mapping provided
+            if model_mapping:
+                display_name = _anonymize_model_name(display_name, model_mapping)
             # Ensure clean translation text for display
             clean_translation = _ensure_clean_translation(polish.processed_text)
             results.append({
@@ -392,12 +428,76 @@ def _collect_model_results(para) -> list[dict[str, Any]]:
     return results
 
 
+def _create_model_alias_mapping(process_data: PipelineProcessData) -> dict[str, str]:
+    """
+    Create a mapping from model names to anonymous aliases (A, B, C, D, ...).
+
+    Returns:
+        Dict mapping original model names to aliases (e.g., {"gpt-4o-mini": "A", "deepseek-chat": "B"})
+    """
+    # Collect all unique model names from translations and polishes
+    model_names: set[str] = set()
+
+    for para in process_data.paragraphs:
+        for trans in para.translations:
+            if trans.model_name:
+                model_names.add(trans.model_name)
+        for polish in para.polishes:
+            if polish.model_name:
+                model_names.add(polish.model_name)
+            if polish.from_translator:
+                model_names.add(polish.from_translator)
+
+    # Sort for consistent ordering
+    sorted_names = sorted(model_names)
+
+    # Create mapping: A, B, C, ..., Z, AA, AB, ...
+    mapping: dict[str, str] = {}
+    for i, name in enumerate(sorted_names):
+        if i < 26:
+            alias = chr(ord('A') + i)
+        else:
+            # For more than 26 models, use AA, AB, etc.
+            alias = chr(ord('A') + (i // 26) - 1) + chr(ord('A') + (i % 26))
+        mapping[name] = alias
+
+    return mapping
+
+
+def _anonymize_model_name(name: str, mapping: dict[str, str]) -> str:
+    """
+    Convert a model name or compound name to its anonymous form.
+
+    Handles:
+    - Simple names: "gpt-4o-mini" -> "A"
+    - Arrow names: "gpt-4o-mini→deepseek-chat" -> "A→B"
+    - Plus names: "gpt-4o-mini+deepseek-chat" -> "A+B"
+    """
+    if not name:
+        return name
+
+    # Handle arrow notation (polisher display names)
+    if "→" in name:
+        parts = name.split("→")
+        return "→".join(mapping.get(p, p) for p in parts)
+
+    # Handle plus notation (internal polisher IDs)
+    if "+" in name:
+        parts = name.split("+")
+        return "+".join(mapping.get(p, p) for p in parts)
+
+    return mapping.get(name, name)
+
+
 def generate_evaluation_report_html(
     process_data: PipelineProcessData,
     output_path: Path | str,
 ) -> str:
     """
-    Generate HTML evaluation report.
+    Generate HTML evaluation report with anonymized model names.
+
+    Model names are replaced with aliases (A, B, C, ...) for blind evaluation.
+    A separate JSON file records the mapping from aliases to actual model names.
 
     Args:
         process_data: Pipeline process data with evaluation results
@@ -409,14 +509,25 @@ def generate_evaluation_report_html(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build aggregated scores
-    model_summary = _aggregate_model_scores(process_data)
+    # Create model alias mapping for anonymization
+    model_mapping = _create_model_alias_mapping(process_data)
 
-    # Generate HTML
-    html_content = _generate_html(process_data, model_summary)
+    # Save mapping to JSON file
+    mapping_path = output_path.parent / "model_mapping.json"
+    with mapping_path.open("w", encoding="utf-8") as f:
+        # Save as {alias: model_name} for easier lookup
+        reverse_mapping = {v: k for k, v in model_mapping.items()}
+        json.dump(reverse_mapping, f, ensure_ascii=False, indent=2)
+    logger.info(f"Model mapping saved to {mapping_path}")
+
+    # Build aggregated scores with anonymized names
+    model_summary = _aggregate_model_scores(process_data, model_mapping)
+
+    # Generate HTML with anonymized names
+    html_content = _generate_html(process_data, model_summary, model_mapping)
 
     # Write to file
-    with open(output_path, "w", encoding="utf-8") as f:
+    with output_path.open("w", encoding="utf-8") as f:
         f.write(html_content)
 
     logger.info(f"HTML report saved to {output_path}")
@@ -426,8 +537,9 @@ def generate_evaluation_report_html(
 def _generate_html(
     process_data: PipelineProcessData,
     model_summary: dict[str, dict[str, Any]],
+    model_mapping: dict[str, str] | None = None,
 ) -> str:
-    """Generate the complete HTML content."""
+    """Generate the complete HTML content with anonymized model names."""
 
     # CSS styles
     css = """
@@ -615,17 +727,48 @@ def _generate_html(
             font-weight: bold;
             color: #2c5282;
         }
+        .cover-header {
+            text-align: center;
+            padding: 20px 0 30px 0;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .cover-header .brand {
+            font-size: 16px;
+            color: #333;
+            margin-bottom: 8px;
+        }
+        .cover-header .brand strong {
+            font-weight: 700;
+        }
+        .cover-header .website {
+            font-size: 14px;
+            color: #4a5568;
+            margin-bottom: 8px;
+        }
+        .cover-header .website a {
+            color: #2c5282;
+            text-decoration: none;
+        }
+        .cover-header .website a:hover {
+            text-decoration: underline;
+        }
+        .cover-header .disclaimer {
+            font-size: 13px;
+            color: #718096;
+            font-style: italic;
+        }
     </style>
     """
 
     # Build summary table
     summary_html = _build_summary_table(model_summary)
 
-    # Build statistics
-    stats_html = _build_stats(process_data)
+    # Build statistics (with anonymized best model name)
+    stats_html = _build_stats(process_data, model_mapping)
 
-    # Build detail sections
-    details_html = _build_detail_sections(process_data)
+    # Build detail sections (with anonymized model names)
+    details_html = _build_detail_sections(process_data, model_mapping)
 
     # Complete HTML
     html = f"""<!DOCTYPE html>
@@ -638,6 +781,12 @@ def _generate_html(
 </head>
 <body>
     <div class="container">
+        <div class="cover-header">
+            <div class="brand">此文件由<strong>译曲同工</strong>提供翻译服务</div>
+            <div class="website">更多信息请访问 <a href="https://aitranspro.com" target="_blank">aitranspro.com</a></div>
+            <div class="disclaimer">——内容仅供内部评估与试阅——</div>
+        </div>
+
         <h1>Translation Evaluation Report</h1>
 
         {stats_html}
@@ -654,13 +803,26 @@ def _generate_html(
     return html
 
 
-def _build_stats(process_data: PipelineProcessData) -> str:
-    """Build statistics section."""
+def _build_stats(
+    process_data: PipelineProcessData,
+    model_mapping: dict[str, str] | None = None,
+) -> str:
+    """Build statistics section with anonymized model names."""
     total_paragraphs = len(process_data.paragraphs)
     total_tokens = process_data.total_token_usage.total_tokens
 
-    # Find best model
+    # Find best model and anonymize if mapping provided
     best_model = process_data.get_best_model() or "N/A"
+    if model_mapping and best_model != "N/A":
+        # Handle prefixed model IDs like "translator:xxx" or "polisher:xxx+yyy"
+        if best_model.startswith("translator:"):
+            display_name = best_model[len("translator:"):]
+            best_model = _anonymize_model_name(display_name, model_mapping)
+        elif best_model.startswith("polisher:"):
+            display_name = best_model[len("polisher:"):].replace("+", "→")
+            best_model = _anonymize_model_name(display_name, model_mapping)
+        else:
+            best_model = _anonymize_model_name(best_model, model_mapping)
     best_score = max(process_data.model_scores.values()) if process_data.model_scores else 0
 
     return f"""
@@ -735,23 +897,30 @@ def _build_summary_table(model_summary: dict[str, dict[str, Any]]) -> str:
     """
 
 
-def _build_detail_sections(process_data: PipelineProcessData) -> str:
-    """Build detailed paragraph sections."""
+def _build_detail_sections(
+    process_data: PipelineProcessData,
+    model_mapping: dict[str, str] | None = None,
+) -> str:
+    """Build detailed paragraph sections with anonymized model names."""
     sections = []
 
     for i, para in enumerate(process_data.paragraphs):
-        sections.append(_build_segment_detail(i + 1, para))
+        sections.append(_build_segment_detail(i + 1, para, model_mapping))
 
     return "".join(sections)
 
 
-def _build_segment_detail(segment_num: int, para) -> str:
-    """Build detail view for one segment/paragraph."""
+def _build_segment_detail(
+    segment_num: int,
+    para,
+    model_mapping: dict[str, str] | None = None,
+) -> str:
+    """Build detail view for one segment/paragraph with anonymized model names."""
     # Source text (already extracted in translator.py) - no truncation
     source_text = para.source_text
 
     # Model results table
-    model_results = _collect_model_results(para)
+    model_results = _collect_model_results(para, model_mapping)
     results_table = _build_model_results_table(model_results)
 
     # Evaluation details
@@ -760,13 +929,36 @@ def _build_segment_detail(segment_num: int, para) -> str:
         eval_items = []
         for ev in para.evaluations:
             if ev.reasoning:
+                # Anonymize evaluator and target model names
+                evaluator_name = ev.evaluator_model
+                target_name = ev.target_model
+                if model_mapping:
+                    evaluator_name = _anonymize_model_name(evaluator_name, model_mapping)
+                    # target_model might have prefix like "translator:" or "polisher:"
+                    if target_name.startswith("translator:"):
+                        target_display = target_name[len("translator:"):]
+                        target_name = _anonymize_model_name(target_display, model_mapping)
+                    elif target_name.startswith("polisher:"):
+                        target_display = target_name[len("polisher:"):].replace("+", "→")
+                        target_name = _anonymize_model_name(target_display, model_mapping)
+                    else:
+                        target_name = _anonymize_model_name(target_name, model_mapping)
+                # Build evaluation item with reasoning and suggestions
+                suggestion_html = ""
+                if ev.suggestions:
+                    suggestion_html = (
+                        f'<div class="suggestion" style="margin-top: 4px; padding-left: 12px; '
+                        f'color: #0066cc; font-style: italic;">'
+                        f'💡 优化建议: {_escape_html(ev.suggestions)}</div>'
+                    )
                 eval_items.append(
-                    f'<div class="evaluation-item">'
-                    f'<strong>{_escape_html(ev.evaluator_model)}</strong> → '
-                    f'<strong>{_escape_html(ev.target_model)}</strong>: '
+                    f'<div class="evaluation-item" style="margin-bottom: 8px;">'
+                    f'<strong>{_escape_html(evaluator_name)}</strong> → '
+                    f'<strong>{_escape_html(target_name)}</strong>: '
                     f'<span class="score" style="background-color: {_score_color(ev.scores.average)}20; '
                     f'color: {_score_color(ev.scores.average)};">{ev.scores.average:.1f}/10</span> '
-                    f'- {_escape_html(ev.reasoning)}</div>'
+                    f'- {_escape_html(ev.reasoning)}'
+                    f'{suggestion_html}</div>'
                 )
         if eval_items:
             eval_details = f"""

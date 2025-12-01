@@ -283,7 +283,8 @@ class EvaluationResult:
     processed_text: str  # 存翻译/润色后去除 json 格式的文本（用于显示和评估）
     raw_json: str = ""  # 从翻译/润色结果 copy 的原始 JSON（用于更新 IL 文档）
     scores: EvaluationScores = field(default_factory=EvaluationScores)
-    reasoning: str = ""  # 评估理由
+    reasoning: str = ""  # 评估理由（打分原因）
+    suggestions: str = ""  # 优化建议
     token_usage: TokenUsage = field(default_factory=TokenUsage)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -302,6 +303,7 @@ class EvaluationResult:
             "raw_json": self.raw_json,
             "scores": self.scores.to_dict(),
             "reasoning": self.reasoning,
+            "suggestions": self.suggestions,
             "token_usage": self.token_usage.to_dict(),
             "metadata": self.metadata,
         }

@@ -15,8 +15,6 @@ import re
 import threading
 from collections import defaultdict
 from concurrent.futures import as_completed
-
-from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -28,27 +26,57 @@ from tenacity import retry_if_exception_type
 from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
-from babeldoc.translator.translator import BaseTranslator
-from babeldoc.translator.pipeline.models import (
-    EvaluationResult,
-    EvaluationScores,
-    ModelConfig,
-    ParagraphProcessData,
-    PipelineConfig,
-    PipelineProcessData,
-    PolishResult,
-    TokenUsage,
-    TranslationResult,
+from babeldoc.translator.pipeline.cache import EvaluationCache
+from babeldoc.translator.pipeline.cache import PolishCache
+from babeldoc.translator.pipeline.cache import TranslationCache
+from babeldoc.translator.pipeline.models import EvaluationResult
+from babeldoc.translator.pipeline.models import EvaluationScores
+from babeldoc.translator.pipeline.models import ModelConfig
+from babeldoc.translator.pipeline.models import ParagraphProcessData
+from babeldoc.translator.pipeline.models import PipelineConfig
+from babeldoc.translator.pipeline.models import PipelineProcessData
+from babeldoc.translator.pipeline.models import PolishResult
+from babeldoc.translator.pipeline.models import TokenUsage
+from babeldoc.translator.pipeline.models import TranslationResult
+from babeldoc.translator.pipeline.report_generator import extract_actual_source_text
+from babeldoc.translator.pipeline.report_generator import (
+    extract_actual_translation_text,
 )
 from babeldoc.translator.pipeline.report_generator import (
     generate_evaluation_report_html,
-    extract_actual_source_text,
-    extract_actual_translation_text,
-    extract_raw_translation_output,
-    strip_markdown_code_block,
 )
+from babeldoc.translator.pipeline.report_generator import strip_markdown_code_block
+from babeldoc.translator.translator import BaseTranslator
+from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_parse_score(value: Any, default: float = 5.0) -> float:
+    """
+    Safely parse a score value to float.
+
+    Handles cases where the model returns non-numeric values like "N/A", "N", etc.
+
+    Args:
+        value: The value to parse (could be int, float, str, or None)
+        default: Default value if parsing fails
+
+    Returns:
+        Parsed float score, or default if parsing fails
+    """
+    if value is None:
+        return default
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        # Try to parse as number
+        try:
+            return float(value)
+        except ValueError:
+            # Handle common non-numeric responses
+            return default
+    return default
 
 
 class ModelClient:
@@ -405,23 +433,23 @@ class PipelineTranslator(BaseTranslator):
         logger.info(f"[Pipeline] 使用并发数: {workers}")
 
         total_paragraphs = len(self._pending_paragraphs)
-        logger.info(f"[Pipeline] ========== 开始批量后处理 ==========")
+        logger.info("[Pipeline] ========== 开始批量后处理 ==========")
         logger.info(f"[Pipeline] 待处理段落数: {total_paragraphs}")
 
         # Stage 2: 批量润色 (并发处理)
         if self.polisher_clients:
             logger.info(f"[Pipeline] Stage 2: 批量润色 ({len(self.polisher_clients)} 个润色模型)")
             self._run_batch_polish(workers, progress_monitor)
-            logger.info(f"[Pipeline] 批量润色完成")
+            logger.info("[Pipeline] 批量润色完成")
 
         # Stage 3: 批量评估 (并发处理)
         if self.evaluator_clients:
             logger.info(f"[Pipeline] Stage 3: 批量评估 ({len(self.evaluator_clients)} 个评估模型)")
             self._run_batch_evaluation(workers, progress_monitor)
-            logger.info(f"[Pipeline] 批量评估完成")
+            logger.info("[Pipeline] 批量评估完成")
 
         # Stage 4: 批量选择最佳结果
-        logger.info(f"[Pipeline] Stage 4: 选择最佳结果")
+        logger.info("[Pipeline] Stage 4: 选择最佳结果")
         for para_data in self._pending_paragraphs:
             display_text, raw_json, selected_model, selected_type = self._select_best(
                 para_data.translations,
@@ -442,7 +470,7 @@ class PipelineTranslator(BaseTranslator):
             for model, scores in self._model_scores.items()
         }
 
-        logger.info(f"[Pipeline] ========== 批量后处理完成 ==========")
+        logger.info("[Pipeline] ========== 批量后处理完成 ==========")
         logger.info(f"[Pipeline] 处理段落数: {len(self._pending_paragraphs)}")
         logger.info(f"[Pipeline] 模型评分: {self._process_data.model_scores}")
 
@@ -478,13 +506,30 @@ class PipelineTranslator(BaseTranslator):
             trans: TranslationResult
         ) -> tuple[str, PolishResult]:
             """执行单个润色任务，返回 (paragraph_id, result)"""
-            import time as _time
-            import threading as _threading
-            start_time = _time.time()
-            thread_id = _threading.current_thread().name
-            # print(f"polish_single: {thread_id}")
+            model_name = client.config.model_name
+
             # 润色时传入翻译器返回的原始 JSON
             input_json = trans.raw_json if trans.raw_json else trans.processed_text
+
+            # Check cache first
+            cache = PolishCache(model_name)
+            cached = cache.get_polish(
+                para_data.source_text,
+                input_json,
+                trans.model_name,
+            )
+            if cached:
+                polished_display, raw_json = cached
+                logger.debug(f"[Pipeline] Polish cache hit: {model_name}")
+                return para_data.paragraph_id, PolishResult(
+                    model_name=model_name,
+                    source_text=para_data.source_text,
+                    processed_text=polished_display,
+                    from_translator=trans.model_name,
+                    raw_json=raw_json,
+                    metadata={"from_cache": True},
+                )
+
             messages = [
                 {
                     "role": "system",
@@ -518,8 +563,19 @@ class PipelineTranslator(BaseTranslator):
                 raw_json = strip_markdown_code_block(content)
                 # 提取润色后的文本用于显示
                 polished_display = extract_actual_translation_text(raw_json)
+
+                # Cache the result
+                if polished_display:
+                    cache.set_polish(
+                        para_data.source_text,
+                        input_json,
+                        trans.model_name,
+                        polished_display,
+                        raw_json,
+                    )
+
                 result = PolishResult(
-                    model_name=client.config.model_name,
+                    model_name=model_name,
                     source_text=para_data.source_text,
                     processed_text=polished_display,  # 提取后的文本用于显示
                     from_translator=trans.model_name,
@@ -528,16 +584,15 @@ class PipelineTranslator(BaseTranslator):
                     metadata={"request_messages": req_messages, "response": content},
                 )
             except Exception as e:
-                logger.exception(f"Polish failed: {client.config.model_name}")
+                logger.exception(f"Polish failed: {model_name}")
                 result = PolishResult(
-                    model_name=client.config.model_name,
+                    model_name=model_name,
                     source_text=para_data.source_text,
                     processed_text=trans.processed_text,  # 失败时使用原翻译的 processed_text
                     from_translator=trans.model_name,
                     raw_json=trans.raw_json,  # 失败时使用原翻译的 raw_json
                     metadata={"error": str(e)},
                 )
-            elapsed = _time.time() - start_time
             return para_data.paragraph_id, result
 
         if progress_monitor:
@@ -600,10 +655,7 @@ class PipelineTranslator(BaseTranslator):
             client: ModelClient,
         ) -> tuple[str, list[EvaluationResult]]:
             """对比评估一个段落的所有翻译/润色结果，返回 (paragraph_id, results)"""
-            import time as _time
-            import threading as _threading
-            start_time = _time.time()
-            thread_id = _threading.current_thread().name
+            model_name = client.config.model_name
 
             # 收集所有候选翻译
             # 使用唯一 ID 来避免相同模型名称的冲突
@@ -636,111 +688,187 @@ class PipelineTranslator(BaseTranslator):
             if not candidates:
                 return para_data.paragraph_id, []
 
-            # print(f"[Pipeline] 开始对比评估: {para_data.paragraph_id}, evaluator={client.config.model_name}, 候选数={len(candidates)}, thread={thread_id}", flush=True)
+            # 构建候选翻译的 key 用于缓存（排序以保证一致性）
+            candidates_key = "|".join(sorted(c["model_id"] + ":" + c["translation"] for c in candidates))
 
-            # 构建对比评估的 prompt
-            candidates_text = ""
-            for i, cand in enumerate(candidates):
-                candidates_text += f"\n### Candidate {i+1} (ID: {cand['model_id']}, Type: {cand['type']})\n{cand['translation']}\n"
-
-            # 构建期望的 JSON 输出格式
-            output_format = {cand["model_id"]: {"accuracy": "N", "fluency": "N", "consistency": "N", "terminology": "N", "completeness": "N", "reasoning": "..."} for cand in candidates}
-
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        f"You are a translation quality evaluator. Compare and evaluate multiple translation candidates from {self.lang_in} to {self.lang_out}.\n\n"
-                        "For EACH candidate, score these dimensions from 1-10:\n"
-                        "- Accuracy: How well the meaning is preserved\n"
-                        "- Fluency: How natural and fluent the translation reads\n"
-                        "- Consistency: Terminology and style consistency\n"
-                        "- Terminology: Technical term accuracy\n"
-                        "- Completeness: No omissions or additions\n\n"
-                        "IMPORTANT: Compare all candidates against each other. Better translations should get higher scores.\n\n"
-                        f"Output a JSON object with each model_id as key:\n{json.dumps(output_format, indent=2)}"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"## Original Text:\n{para_data.source_text}\n\n## Translation Candidates:{candidates_text}",
-                },
-            ]
-
-            results: list[EvaluationResult] = []
-            try:
-                content, token_usage, req_messages = client.chat(
-                    messages, response_format={"type": "json_object"}
-                )
-
-                # 解析对比评估结果
-                eval_data = json.loads(content)
-
+            # Check cache first
+            cache = EvaluationCache(model_name)
+            cached = cache.get_evaluation(para_data.source_text, candidates_key)
+            if cached:
+                logger.debug(f"[Pipeline] Evaluation cache hit: {model_name}")
+                results: list[EvaluationResult] = []
                 for cand in candidates:
                     model_id = cand["model_id"]
-                    if model_id in eval_data:
-                        model_eval = eval_data[model_id]
+                    if model_id in cached:
+                        model_eval = cached[model_id]
                         scores = EvaluationScores(
-                            accuracy=float(model_eval.get("accuracy", 5)),
-                            fluency=float(model_eval.get("fluency", 5)),
-                            consistency=float(model_eval.get("consistency", 5)),
-                            terminology=float(model_eval.get("terminology", 5)),
-                            completeness=float(model_eval.get("completeness", 5)),
+                            accuracy=_safe_parse_score(model_eval.get("accuracy")),
+                            fluency=_safe_parse_score(model_eval.get("fluency")),
+                            consistency=_safe_parse_score(model_eval.get("consistency")),
+                            terminology=_safe_parse_score(model_eval.get("terminology")),
+                            completeness=_safe_parse_score(model_eval.get("completeness")),
                         )
                         reasoning = model_eval.get("reasoning", "")
+                        suggestions = model_eval.get("suggestions", "")
 
                         # Track scores for model ranking
                         with self._lock:
                             self._model_scores[model_id].append(scores.average)
 
                         results.append(EvaluationResult(
-                            evaluator_model=client.config.model_name,
+                            evaluator_model=model_name,
                             target_model=model_id,
                             target_type=cand["type"],
                             source_text=para_data.source_text,
-                            processed_text=cand["translation"],  # 用于显示和评估
-                            raw_json=cand["raw_json"],  # 从翻译/润色结果 copy 的原始 JSON
+                            processed_text=cand["translation"],
+                            raw_json=cand["raw_json"],
                             scores=scores,
                             reasoning=reasoning,
-                            token_usage=TokenUsage(
-                                input_tokens=token_usage.input_tokens // len(candidates),
-                                output_tokens=token_usage.output_tokens // len(candidates),
-                                total_tokens=token_usage.total_tokens // len(candidates),
-                            ),
-                            metadata={"request_messages": req_messages, "response": content},
+                            suggestions=suggestions,
+                            metadata={"from_cache": True},
                         ))
+                return para_data.paragraph_id, results
+
+            # 构建对比评估的 prompt
+            candidates_text = ""
+            for i, cand in enumerate(candidates):
+                candidates_text += f"\n### 候选翻译 {i+1} (ID: {cand['model_id']}, 类型: {cand['type']})\n{cand['translation']}\n"
+
+            # 构建期望的 JSON 输出格式
+            output_format = {
+                cand["model_id"]: {
+                    "accuracy": "1-10分",
+                    "fluency": "1-10分",
+                    "consistency": "1-10分",
+                    "terminology": "1-10分",
+                    "completeness": "1-10分",
+                    "reasoning": "简要说明打分理由（中文）",
+                    "suggestions": "优化建议（中文）",
+                }
+                for cand in candidates
+            }
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"你是一名专业的翻译质量评估专家。请对比评估多个从 {self.lang_in} 到 {self.lang_out} 的翻译候选结果。\n\n"
+                        "## 评分维度（1-10分）\n"
+                        "- accuracy（准确性）：翻译是否准确传达原文含义，有无误译、漏译\n"
+                        "- fluency（流畅性）：译文是否通顺自然，符合目标语言表达习惯\n"
+                        "- consistency（一致性）：术语和风格是否前后统一\n"
+                        "- terminology（术语）：专业术语翻译是否准确、规范\n"
+                        "- completeness（完整性）：是否完整翻译原文内容，无遗漏或冗余\n\n"
+                        "## 评分要求\n"
+                        "1. 请将所有候选翻译相互对比，翻译质量更好的应该获得更高分数\n"
+                        "2. 分数应有区分度，避免所有候选都给相同分数\n"
+                        "3. 评分应客观公正，基于实际翻译质量而非主观偏好\n"
+                        "4. 注意：原文可能因技术原因被截断，如果译文比原文内容更完整，这是正常的，不应因此扣分\n"
+                        "5. 如果原文很短或被截断，重点评估译文的流畅性和准确性，放宽对完整性的要求\n\n"
+                        "## 输出要求\n"
+                        "- reasoning 字段：用中文简要说明打分理由，指出翻译的优点和不足\n"
+                        "- suggestions 字段：用中文给出具体的优化建议，说明如何改进翻译\n\n"
+                        f"## 输出格式\n请输出 JSON 对象，每个 model_id 为键：\n{json.dumps(output_format, indent=2, ensure_ascii=False)}"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"## 原文\n{para_data.source_text}\n\n## 候选翻译{candidates_text}",
+                },
+            ]
+
+            results: list[EvaluationResult] = []
+            max_retries = 3
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    content, token_usage, req_messages = client.chat(
+                        messages, response_format={"type": "json_object"}
+                    )
+
+                    # 解析对比评估结果
+                    eval_data = json.loads(content)
+
+                    # Cache the evaluation result
+                    cache.set_evaluation(para_data.source_text, candidates_key, eval_data)
+
+                    for cand in candidates:
+                        model_id = cand["model_id"]
+                        if model_id in eval_data:
+                            model_eval = eval_data[model_id]
+                            scores = EvaluationScores(
+                                accuracy=_safe_parse_score(model_eval.get("accuracy")),
+                                fluency=_safe_parse_score(model_eval.get("fluency")),
+                                consistency=_safe_parse_score(model_eval.get("consistency")),
+                                terminology=_safe_parse_score(model_eval.get("terminology")),
+                                completeness=_safe_parse_score(model_eval.get("completeness")),
+                            )
+                            reasoning = model_eval.get("reasoning", "")
+                            suggestions = model_eval.get("suggestions", "")
+
+                            # Track scores for model ranking
+                            with self._lock:
+                                self._model_scores[model_id].append(scores.average)
+
+                            results.append(EvaluationResult(
+                                evaluator_model=model_name,
+                                target_model=model_id,
+                                target_type=cand["type"],
+                                source_text=para_data.source_text,
+                                processed_text=cand["translation"],  # 用于显示和评估
+                                raw_json=cand["raw_json"],  # 从翻译/润色结果 copy 的原始 JSON
+                                scores=scores,
+                                reasoning=reasoning,
+                                suggestions=suggestions,
+                                token_usage=TokenUsage(
+                                    input_tokens=token_usage.input_tokens // len(candidates),
+                                    output_tokens=token_usage.output_tokens // len(candidates),
+                                    total_tokens=token_usage.total_tokens // len(candidates),
+                                ),
+                                metadata={"request_messages": req_messages, "response": content},
+                            ))
+                        else:
+                            # 模型没有返回该候选的评分，使用默认值
+                            results.append(EvaluationResult(
+                                evaluator_model=model_name,
+                                target_model=model_id,
+                                target_type=cand["type"],
+                                source_text=para_data.source_text,
+                                processed_text=cand["translation"],  # 用于显示和评估
+                                raw_json=cand["raw_json"],  # 从翻译/润色结果 copy 的原始 JSON
+                                metadata={"error": f"No evaluation returned for {model_id}"},
+                            ))
+
+                    # 成功，跳出重试循环
+                    break
+
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Evaluation attempt {attempt + 1}/{max_retries} failed: "
+                            f"{client.config.model_name}, retrying..."
+                        )
+                        continue
                     else:
-                        # 模型没有返回该候选的评分，使用默认值
-                        results.append(EvaluationResult(
-                            evaluator_model=client.config.model_name,
-                            target_model=model_id,
-                            target_type=cand["type"],
-                            source_text=para_data.source_text,
-                            processed_text=cand["translation"],  # 用于显示和评估
-                            raw_json=cand["raw_json"],  # 从翻译/润色结果 copy 的原始 JSON
-                            metadata={"error": f"No evaluation returned for {model_id}"},
-                        ))
+                        logger.exception(
+                            f"Comparative evaluation failed after {max_retries} attempts: "
+                            f"{client.config.model_name}"
+                        )
+                        # 为所有候选创建错误结果
+                        for cand in candidates:
+                            results.append(EvaluationResult(
+                                evaluator_model=client.config.model_name,
+                                target_model=cand["model_id"],
+                                target_type=cand["type"],
+                                source_text=para_data.source_text,
+                                processed_text=cand["translation"],  # 用于显示和评估
+                                raw_json=cand["raw_json"],  # 从翻译/润色结果 copy 的原始 JSON
+                                metadata={"error": str(last_error), "attempts": max_retries},
+                            ))
 
-            except Exception as e:
-                logger.exception(f"Comparative evaluation failed: {client.config.model_name}")
-                # 为所有候选创建错误结果
-                for cand in candidates:
-                    results.append(EvaluationResult(
-                        evaluator_model=client.config.model_name,
-                        target_model=cand["model_id"],
-                        target_type=cand["type"],
-                        source_text=para_data.source_text,
-                        processed_text=cand["translation"],  # 用于显示和评估
-                        raw_json=cand["raw_json"],  # 从翻译/润色结果 copy 的原始 JSON
-                        metadata={"error": str(e)},
-                    ))
-
-            elapsed = _time.time() - start_time
-            scores_summary = ", ".join([f"{r.target_model}:{r.scores.average:.1f}" for r in results if r.scores])
-            # print(f"[Pipeline] 完成对比评估: {para_data.paragraph_id}, evaluator={client.config.model_name}, 结果=[{scores_summary}], 耗时={elapsed:.2f}s, thread={thread_id}", flush=True)
             return para_data.paragraph_id, results
-
-        # print(f"[Pipeline] 对比评估任务总数: {len(all_tasks)}, 并发数: {workers}", flush=True)
 
         if progress_monitor:
             with progress_monitor.stage_start("Evaluate Translations", total_paragraphs) as pbar:
@@ -785,6 +913,8 @@ class PipelineTranslator(BaseTranslator):
         When used with ILTranslatorLLMOnly, the text parameter is already a complete
         prompt built by _build_llm_prompt, containing role instructions, contextual hints,
         glossary tables, and JSON input format. We should use it directly as the user message.
+
+        Uses text hash based caching to avoid redundant API calls.
         """
         results: list[TranslationResult] = []
 
@@ -792,6 +922,22 @@ class PipelineTranslator(BaseTranslator):
             return results
 
         def translate_with_model(client: ModelClient) -> TranslationResult:
+            model_name = client.config.model_name
+
+            # Check cache first
+            cache = TranslationCache(model_name)
+            cached = cache.get_translation(text)
+            if cached:
+                processed_text, raw_json = cached
+                logger.debug(f"[Pipeline] Translation cache hit: {model_name}")
+                return TranslationResult(
+                    model_name=model_name,
+                    source_text=text,
+                    processed_text=processed_text,
+                    raw_json=raw_json,
+                    metadata={"from_cache": True},
+                )
+
             # The text from ILTranslatorLLMOnly already contains the complete prompt
             # with all instructions, so we use it directly as user content
             messages = [
@@ -801,8 +947,13 @@ class PipelineTranslator(BaseTranslator):
                 content, token_usage, req_messages = client.chat(messages)
                 raw_json = strip_markdown_code_block(content)
                 processed_text = extract_actual_translation_text(raw_json)
+
+                # Cache the result
+                if processed_text:
+                    cache.set_translation(text, processed_text, raw_json)
+
                 return TranslationResult(
-                    model_name=client.config.model_name,
+                    model_name=model_name,
                     source_text=text,
                     processed_text=processed_text,
                     raw_json=raw_json,
@@ -810,9 +961,9 @@ class PipelineTranslator(BaseTranslator):
                     metadata={"request_messages": req_messages, "response": content},
                 )
             except Exception as e:
-                logger.exception(f"Translation failed: {client.config.model_name}")
+                logger.exception(f"Translation failed: {model_name}")
                 return TranslationResult(
-                    model_name=client.config.model_name,
+                    model_name=model_name,
                     source_text=text,
                     processed_text="",
                     raw_json="",

@@ -7,6 +7,7 @@
     2. 运行: uv run python scripts/run_pipeline_test.py
 """
 
+import os
 import asyncio
 from pathlib import Path
 
@@ -15,44 +16,43 @@ from pathlib import Path
 # ============================================================
 
 # 输入PDF文件路径
-INPUT_PDF = "/Users/chtw/codes/iweaver/BabelDOC/examples/ci/test.pdf"
+INPUT_PDF = "/Users/chtw/codes/iweaver/BabelDOC/examples/docs/20251201.pdf"
 
 # 输出目录
-OUTPUT_DIR = "/Users/chtw/codes/iweaver/BabelDOC/output/pipeline_test"
+OUTPUT_DIR = "/Users/chtw/codes/iweaver/BabelDOC/output/pipeline2"
 
 # 语言设置
 LANG_IN = "en"
-LANG_OUT = "zh"
+LANG_OUT = "cn"
+
+
+api_key = os.getenv("OPENAI_API_KEY")
 
 # API配置 - 翻译模型
 TRANSLATORS = [
     {
-        "model_name": "deepseek-chat",
-        "base_url": "https://api.deepseek.com/v1",
-        "api_key": "sk-0f0a93adb7124908a2ecfeccb63b43d8",  # 替换为你的API key
-    },
-    {
-        "model_name": "gpt-4o-mini",
+        "model_name": "deepseek-ai/DeepSeek-V3.2-Exp",
         "base_url": "https://api.modelverse.cn/v1/",
-        "api_key": "gWU4ecFVBoEucRwl4dFe0c13-347D-4eA9-93b7-07306684",
+        "api_key": api_key,
     },
+
 ]
 
 # API配置 - 润色模型 (可选，留空则跳过润色阶段)
 POLISHERS = [
     {
-        "model_name": "gpt-4o-mini",
+        "model_name": "gemini-2.5-flash",
         "base_url": "https://api.modelverse.cn/v1/",
-        "api_key": "gWU4ecFVBoEucRwl4dFe0c13-347D-4eA9-93b7-07306684",
+        "api_key": api_key
     },
 ]
 
 # API配置 - 评估模型 (可选，留空则跳过评估阶段)
 EVALUATORS = [
     {
-        "model_name": "gpt-4o-mini",
+        "model_name": "gemini-2.5-flash",
         "base_url": "https://api.modelverse.cn/v1/",
-        "api_key": "gWU4ecFVBoEucRwl4dFe0c13-347D-4eA9-93b7-07306684",  # 替换为你的API key
+        "api_key": api_key
     },
 ]
 
