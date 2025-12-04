@@ -29,6 +29,7 @@ from tenacity import wait_exponential
 from babeldoc.translator.pipeline.cache import EvaluationCache
 from babeldoc.translator.pipeline.cache import PolishCache
 from babeldoc.translator.pipeline.cache import TranslationCache
+from babeldoc.translator.pipeline.cache import _compute_hash
 from babeldoc.translator.pipeline.models import EvaluationResult
 from babeldoc.translator.pipeline.models import EvaluationScores
 from babeldoc.translator.pipeline.models import ModelConfig
@@ -407,9 +408,13 @@ class PipelineTranslator(BaseTranslator):
 
     def finalize_batch(self, progress_monitor=None, pool_max_workers: int | None = None) -> None:
         """
-        完成批量处理：对所有已翻译的段落执行润色和评估。
+        完成批量处理：对所有已翻译的段落执行评估、优化和最终选择。
 
-        在所有段落翻译完成后调用此方法。
+        Workflow:
+        1. Stage 2: 初始评估 (Model B) - 评估 Model A 的翻译，给出优化建议
+        2. Stage 3: 优化 (Model C) - 如果分数 < 9.5，使用建议进行优化
+        3. Stage 4: 对比评估 (Model B) - 评估 A vs C
+        4. Stage 5: 选择 - 选择分数更高的结果
 
         Args:
             progress_monitor: 可选的进度监控器，用于显示进度条
@@ -436,20 +441,51 @@ class PipelineTranslator(BaseTranslator):
         logger.info("[Pipeline] ========== 开始批量后处理 ==========")
         logger.info(f"[Pipeline] 待处理段落数: {total_paragraphs}")
 
-        # Stage 2: 批量润色 (并发处理)
-        if self.polisher_clients:
-            logger.info(f"[Pipeline] Stage 2: 批量润色 ({len(self.polisher_clients)} 个润色模型)")
-            self._run_batch_polish(workers, progress_monitor)
-            logger.info("[Pipeline] 批量润色完成")
-
-        # Stage 3: 批量评估 (并发处理)
+        # Stage 2: 初始评估 (获取建议)
         if self.evaluator_clients:
-            logger.info(f"[Pipeline] Stage 3: 批量评估 ({len(self.evaluator_clients)} 个评估模型)")
-            self._run_batch_evaluation(workers, progress_monitor)
-            logger.info("[Pipeline] 批量评估完成")
+            logger.info(f"[Pipeline] Stage 2: 初始评估 ({len(self.evaluator_clients)} 个评估模型)")
+            # 这一步会评估当前的翻译结果 (Model A)，并生成 suggestions
+            self._run_batch_evaluation(workers, progress_monitor, stage_name="Initial Evaluation")
+            logger.info("[Pipeline] 初始评估完成")
 
-        # Stage 4: 批量选择最佳结果
-        logger.info("[Pipeline] Stage 4: 选择最佳结果")
+        # Stage 3: 条件优化 (根据建议优化)
+        if self.polisher_clients:
+            logger.info(f"[Pipeline] Stage 3: 条件优化 ({len(self.polisher_clients)} 个润色模型)")
+            # 筛选需要优化的段落 (score < 9.5)
+            paragraphs_to_optimize = []
+            for para in self._pending_paragraphs:
+                # 获取该段落的最佳评估分数
+                best_score = 0.0
+                suggestions = ""
+                
+                # 查找针对翻译结果的评估
+                for ev in para.evaluations:
+                    if ev.target_type == "translator" and ev.scores.average > best_score:
+                        best_score = ev.scores.average
+                        suggestions = ev.suggestions
+                        scores = ev.scores
+
+                # 如果分数不够高且有建议，则进行优化
+                if best_score < 9.5:
+                    paragraphs_to_optimize.append((para, suggestions, scores))
+            
+            if paragraphs_to_optimize:
+                logger.info(f"[Pipeline] 需要优化的段落数: {len(paragraphs_to_optimize)}")
+                self._run_batch_optimization(workers, paragraphs_to_optimize, progress_monitor)
+                logger.info("[Pipeline] 优化完成")
+            else:
+                logger.info("[Pipeline] 没有需要优化的段落")
+
+        # Stage 4: 对比评估 (A vs C)
+        # 如果进行了优化，我们需要评估优化后的结果，并与原结果对比
+        # 这里再次运行批量评估，_run_batch_evaluation 会自动收集所有 candidates (包括新的 polishes) 进行对比
+        if self.evaluator_clients and self.polisher_clients:
+            logger.info(f"[Pipeline] Stage 4: 对比评估 (A vs C)")
+            self._run_batch_evaluation(workers, progress_monitor, stage_name="Comparative Evaluation")
+            logger.info("[Pipeline] 对比评估完成")
+
+        # Stage 5: 选择最佳结果
+        logger.info("[Pipeline] Stage 5: 选择最佳结果")
         for para_data in self._pending_paragraphs:
             display_text, raw_json, selected_model, selected_type = self._select_best(
                 para_data.translations,
@@ -476,146 +512,157 @@ class PipelineTranslator(BaseTranslator):
 
         self._pending_paragraphs.clear()
 
-    def _run_batch_polish(self, workers: int, progress_monitor=None) -> None:
-        """并发执行批量润色 - 将所有段落的润色任务扁平化后并发执行。"""
-        total_paragraphs = len(self._pending_paragraphs)
-
+    def _run_batch_optimization(
+        self, 
+        workers: int, 
+        paragraphs_to_optimize: list[tuple[ParagraphProcessData, str, EvaluationScores]], 
+        progress_monitor=None
+    ) -> None:
+        """并发执行批量优化 (Stage 3)"""
         if not self.polisher_clients:
             return
 
-        # 构建所有润色任务: (para_data, client, translation)
-        all_tasks: list[tuple[ParagraphProcessData, ModelClient, TranslationResult]] = []
-        for para_data in self._pending_paragraphs:
-            for client in self.polisher_clients:
-                for trans in para_data.translations:
-                    if trans.processed_text:
-                        all_tasks.append((para_data, client, trans))
+        # 构建优化任务
+        all_tasks: list[tuple[ParagraphProcessData, ModelClient, TranslationResult, str, EvaluationScores]] = []
+        for para_data, suggestions, scores in paragraphs_to_optimize:
+            # 使用第一个翻译结果作为基准进行优化
+            if para_data.translations:
+                trans = para_data.translations[0]
+                if trans.processed_text:
+                    for client in self.polisher_clients:
+                        all_tasks.append((para_data, client, trans, suggestions, scores))
 
         # 用于跟踪每个段落的润色结果
         para_polishes: dict[str, list[PolishResult]] = {
-            p.paragraph_id: [] for p in self._pending_paragraphs
+            p[0].paragraph_id: [] for p in paragraphs_to_optimize
         }
         completed_paragraphs: set[str] = set()
-        tasks_per_paragraph = len(self.polisher_clients) * max(
-            len(p.translations) for p in self._pending_paragraphs
-        ) if self._pending_paragraphs else 1
+        total_tasks = len(paragraphs_to_optimize)
 
-        def polish_single(
+        def optimize_single(
             para_data: ParagraphProcessData,
             client: ModelClient,
-            trans: TranslationResult
+            trans: TranslationResult,
+            suggestions: str,
+            scores: EvaluationScores
         ) -> tuple[str, PolishResult]:
-            """执行单个润色任务，返回 (paragraph_id, result)"""
+            """执行单个优化任务"""
             model_name = client.config.model_name
-
-            # 润色时传入翻译器返回的原始 JSON
             input_json = trans.raw_json if trans.raw_json else trans.processed_text
 
-            # Check cache first
+            # Check cache (include suggestions in key)
             cache = PolishCache(model_name)
-            cached = cache.get_polish(
-                para_data.source_text,
-                input_json,
-                trans.model_name,
-            )
+            # 使用 suggestions 作为额外的 key 部分
+            extra_key = f"{trans.model_name}|opt|{_compute_hash(suggestions)}"
+            cached = cache.get_polish(para_data.source_text, input_json, extra_key)
+            
             if cached:
                 polished_display, raw_json = cached
-                logger.debug(f"[Pipeline] Polish cache hit: {model_name}")
+                logger.debug(f"[Pipeline] Optimization cache hit: {model_name}")
                 return para_data.paragraph_id, PolishResult(
                     model_name=model_name,
                     source_text=para_data.source_text,
                     processed_text=polished_display,
                     from_translator=trans.model_name,
                     raw_json=raw_json,
-                    metadata={"from_cache": True},
+                    metadata={"from_cache": True, "optimized": True},
                 )
+
+            # Format scores for the prompt
+            scores_text = (
+                f"- Accuracy: {scores.accuracy}/10\n"
+                f"- Fluency: {scores.fluency}/10\n"
+                f"- Consistency: {scores.consistency}/10\n"
+                f"- Terminology: {scores.terminology}/10\n"
+                f"- Completeness: {scores.completeness}/10"
+            )
 
             messages = [
                 {
                     "role": "system",
                     "content": (
                         f"You are a professional translation editor. "
-                        f"Polish and improve the following {self.lang_out} translation. "
-                        f"Fix any errors, improve fluency, but preserve the original meaning.\n\n"
+                        f"Optimize the following {self.lang_out} translation based on the evaluation scores and suggestions.\n\n"
+                        f"## Evaluation Scores\n{scores_text}\n\n"
+                        f"## Optimization Goal\n"
+                        f"Focus on improving the dimensions with lower scores while maintaining the strengths of the original translation.\n\n"
                         f"## CRITICAL RULES:\n"
                         f"1. Input is a JSON array. Output MUST be a JSON array with the SAME number of elements.\n"
                         f"2. Each element MUST keep the same 'id' value from the input.\n"
-                        f"3. Replace 'input' field with 'output' field containing your polished translation.\n"
+                        f"3. Replace 'input' field with 'output' field containing your optimized translation.\n"
                         f"4. Keep ALL <style id='N'>...</style> tags exactly as they appear.\n"
                         f"5. Keep ALL {{vN}} placeholders exactly as they appear.\n"
                         f"6. Only modify the actual translated text content, not the structure.\n\n"
                         f"## Example:\n"
-                        f"Input: [{{'id': 0, 'output': 'text1'}}, {{'id': 1, 'output': 'text2'}}]\n"
-                        f"Output: [{{'id': 0, 'output': 'polished1'}}, {{'id': 1, 'output': 'polished2'}}]"
+                        f"Input: [{{'id': 0, 'output': 'text1'}}]\n"
+                        f"Output: [{{'id': 0, 'output': 'optimized1'}}]"
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
                         f"Original ({self.lang_in}):\n{para_data.source_text}\n\n"
-                        f"Translation to polish (JSON array):\n{input_json}"
+                        f"Current Translation (JSON array):\n{input_json}\n\n"
+                        f"Optimization Suggestions:\n{suggestions}"
                     ),
                 },
             ]
+            
             try:
                 content, token_usage, req_messages = client.chat(messages)
-                # 去除 markdown 代码块格式
                 raw_json = strip_markdown_code_block(content)
-                # 提取润色后的文本用于显示
-                polished_display = extract_actual_translation_text(raw_json)
+                processed_text = extract_actual_translation_text(raw_json)
 
-                # Cache the result
-                if polished_display:
+                if processed_text:
                     cache.set_polish(
                         para_data.source_text,
                         input_json,
-                        trans.model_name,
-                        polished_display,
+                        extra_key,
+                        processed_text,
                         raw_json,
                     )
 
                 result = PolishResult(
                     model_name=model_name,
                     source_text=para_data.source_text,
-                    processed_text=polished_display,  # 提取后的文本用于显示
+                    processed_text=processed_text,
                     from_translator=trans.model_name,
-                    raw_json=raw_json,  # 存储润色器返回的原始 JSON（已去除 markdown 代码块）
+                    raw_json=raw_json,
                     token_usage=token_usage,
-                    metadata={"request_messages": req_messages, "response": content},
+                    metadata={"request_messages": req_messages, "response": content, "optimized": True},
                 )
             except Exception as e:
-                logger.exception(f"Polish failed: {model_name}")
+                logger.exception(f"Optimization failed: {model_name}")
                 result = PolishResult(
                     model_name=model_name,
                     source_text=para_data.source_text,
-                    processed_text=trans.processed_text,  # 失败时使用原翻译的 processed_text
+                    processed_text=trans.processed_text,
                     from_translator=trans.model_name,
-                    raw_json=trans.raw_json,  # 失败时使用原翻译的 raw_json
+                    raw_json=trans.raw_json,
                     metadata={"error": str(e)},
                 )
             return para_data.paragraph_id, result
 
         if progress_monitor:
-            with progress_monitor.stage_start("Polish Translations", total_paragraphs) as pbar:
+            with progress_monitor.stage_start("Optimize Translations", total_tasks) as pbar:
                 with PriorityThreadPoolExecutor(max_workers=workers) as executor:
                     futures = {
-                        executor.submit(polish_single, para_data, client, trans): (para_data, client, trans)
-                        for para_data, client, trans in all_tasks
+                        executor.submit(optimize_single, p, c, t, s, sc): (p, c, t, s, sc)
+                        for p, c, t, s, sc in all_tasks
                     }
                     for future in as_completed(futures):
                         para_id, result = future.result()
                         with self._lock:
                             para_polishes[para_id].append(result)
                             self._process_data.add_token_usage(result.model_name, result.token_usage)
-                            # 检查该段落是否完成所有润色任务
                             if len(para_polishes[para_id]) >= len(self.polisher_clients) and para_id not in completed_paragraphs:
                                 completed_paragraphs.add(para_id)
                                 pbar.advance(1)
         else:
             with PriorityThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
-                    executor.submit(polish_single, para_data, client, trans): (para_data, client, trans)
-                    for para_data, client, trans in all_tasks
+                    executor.submit(optimize_single, p, c, t, s, sc): (p, c, t, s, sc)
+                    for p, c, t, s, sc in all_tasks
                 }
                 for future in as_completed(futures):
                     para_id, result = future.result()
@@ -624,13 +671,14 @@ class PipelineTranslator(BaseTranslator):
                         self._process_data.add_token_usage(result.model_name, result.token_usage)
                         if len(para_polishes[para_id]) >= len(self.polisher_clients) and para_id not in completed_paragraphs:
                             completed_paragraphs.add(para_id)
-                            logger.info(f"[Pipeline] 润色进度: {len(completed_paragraphs)}/{total_paragraphs}")
+                            logger.info(f"[Pipeline] 优化进度: {len(completed_paragraphs)}/{total_tasks}")
 
-        # 将结果写回各段落
+        # 将结果写回各段落 (追加到 polishes 列表)
         for para_data in self._pending_paragraphs:
-            para_data.polishes = para_polishes[para_data.paragraph_id]
+            if para_data.paragraph_id in para_polishes:
+                para_data.polishes.extend(para_polishes[para_data.paragraph_id])
 
-    def _run_batch_evaluation(self, workers: int, progress_monitor=None) -> None:
+    def _run_batch_evaluation(self, workers: int, progress_monitor=None, stage_name="Evaluate Translations") -> None:
         """并发执行批量评估 - 对比评估模式，每个段落的所有翻译/润色结果一起评估。"""
         total_paragraphs = len(self._pending_paragraphs)
 
@@ -871,7 +919,7 @@ class PipelineTranslator(BaseTranslator):
             return para_data.paragraph_id, results
 
         if progress_monitor:
-            with progress_monitor.stage_start("Evaluate Translations", total_paragraphs) as pbar:
+            with progress_monitor.stage_start(stage_name, total_paragraphs) as pbar:
                 with PriorityThreadPoolExecutor(max_workers=workers) as executor:
                     futures = {
                         executor.submit(evaluate_paragraph_comparative, para_data, client): para_data
@@ -943,32 +991,59 @@ class PipelineTranslator(BaseTranslator):
             messages = [
                 {"role": "user", "content": text},
             ]
-            try:
-                content, token_usage, req_messages = client.chat(messages)
-                raw_json = strip_markdown_code_block(content)
-                processed_text = extract_actual_translation_text(raw_json)
+            
+            # Stage 1.5: Fix Check - Retry if translation equals source text
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    content, token_usage, req_messages = client.chat(messages)
+                    raw_json = strip_markdown_code_block(content)
+                    processed_text = extract_actual_translation_text(raw_json)
 
-                # Cache the result
-                if processed_text:
-                    cache.set_translation(text, processed_text, raw_json)
+                    # Check if translation is identical to source (ignoring whitespace)
+                    # We need to extract actual source from the prompt to compare
+                    actual_source = extract_actual_source_text(text)
+                    if processed_text.strip() == actual_source.strip() and len(actual_source.strip()) > 5:
+                        logger.warning(f"[Pipeline] Translation equals source (attempt {attempt+1}/{max_retries+1}): {model_name}")
+                        if attempt < max_retries:
+                            # Add a system message to encourage translation
+                            messages.append({"role": "assistant", "content": content})
+                            messages.append({
+                                "role": "user", 
+                                "content": "The translation is identical to the source text. Please translate it into the target language."
+                            })
+                            continue
+                    
+                    # Cache the result
+                    if processed_text:
+                        cache.set_translation(text, processed_text, raw_json)
 
-                return TranslationResult(
-                    model_name=model_name,
-                    source_text=text,
-                    processed_text=processed_text,
-                    raw_json=raw_json,
-                    token_usage=token_usage,
-                    metadata={"request_messages": req_messages, "response": content},
-                )
-            except Exception as e:
-                logger.exception(f"Translation failed: {model_name}")
-                return TranslationResult(
-                    model_name=model_name,
-                    source_text=text,
-                    processed_text="",
-                    raw_json="",
-                    metadata={"error": str(e)},
-                )
+                    return TranslationResult(
+                        model_name=model_name,
+                        source_text=text,
+                        processed_text=processed_text,
+                        raw_json=raw_json,
+                        token_usage=token_usage,
+                        metadata={"request_messages": req_messages, "response": content},
+                    )
+                except Exception as e:
+                    logger.exception(f"Translation failed: {model_name}")
+                    if attempt == max_retries:
+                        return TranslationResult(
+                            model_name=model_name,
+                            source_text=text,
+                            processed_text="",
+                            raw_json="",
+                            metadata={"error": str(e)},
+                        )
+            
+            return TranslationResult(
+                model_name=model_name,
+                source_text=text,
+                processed_text="",
+                raw_json="",
+                metadata={"error": "Max retries exceeded"},
+            )
 
         with PriorityThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
@@ -1297,7 +1372,7 @@ class PipelineTranslator(BaseTranslator):
         logger.info(f"Process data saved to {json_path}")
         return str(json_path)
 
-    def generate_report(self, output_dir: Path | str | None = None) -> str | None:
+    def generate_report(self, output_dir: Path | str | None = None, original_filename: str = "report") -> str | None:
         """Generate evaluation report in HTML format.
 
         The HTML report contains:
@@ -1309,7 +1384,12 @@ class PipelineTranslator(BaseTranslator):
             return None
 
         save_dir.mkdir(parents=True, exist_ok=True)
-        report_path = save_dir / "evaluation_report.html"
+        
+        # Construct filename: {original_filename}-{lang_in}-{lang_out}.html
+        # Remove extension from original_filename if present
+        base_name = Path(original_filename).stem
+        report_name = f"{base_name}-{self.pipeline_config.lang_in}-{self.pipeline_config.lang_out}.html"
+        report_path = save_dir / report_name
 
         data = self.get_process_data()
         html_path = generate_evaluation_report_html(data, report_path)

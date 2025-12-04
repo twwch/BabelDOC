@@ -435,18 +435,24 @@ def _create_model_alias_mapping(process_data: PipelineProcessData) -> dict[str, 
     Returns:
         Dict mapping original model names to aliases (e.g., {"gpt-4o-mini": "A", "deepseek-chat": "B"})
     """
-    # Collect all unique model names from translations and polishes
+    # Collect all unique model names from translations, polishes, and evaluations
     model_names: set[str] = set()
 
     for para in process_data.paragraphs:
+        # Translator models
         for trans in para.translations:
             if trans.model_name:
                 model_names.add(trans.model_name)
+        # Polisher models
         for polish in para.polishes:
             if polish.model_name:
                 model_names.add(polish.model_name)
             if polish.from_translator:
                 model_names.add(polish.from_translator)
+        # Evaluator models
+        for ev in para.evaluations:
+            if ev.evaluator_model:
+                model_names.add(ev.evaluator_model)
 
     # Sort for consistent ordering
     sorted_names = sorted(model_names)

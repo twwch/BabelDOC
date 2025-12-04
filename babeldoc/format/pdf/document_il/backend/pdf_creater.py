@@ -1240,12 +1240,9 @@ class PDFCreater:
     ) -> TranslateResult:
         try:
             basename = Path(translation_config.input_file).stem
-            debug_suffix = ".debug" if translation_config.debug else ""
-            if (
-                translation_config.watermark_output_mode
-                != WatermarkOutputMode.Watermarked
-            ):
-                debug_suffix += ".no_watermark"
+            debug_suffix = ""
+            if translation_config.debug:
+                debug_suffix = ".debug"
             mono_out_path = translation_config.get_output_file_path(
                 f"{basename}{debug_suffix}.{translation_config.lang_out}.mono.pdf",
             )

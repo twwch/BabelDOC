@@ -16,14 +16,18 @@ from pathlib import Path
 # ============================================================
 
 # 输入PDF文件路径
-INPUT_PDF = "/Users/chtw/codes/iweaver/BabelDOC/examples/docs/20251201.pdf"
+# INPUT_PDF = "/Users/chtw/codes/iweaver/BabelDOC/examples/docs/20251201.pdf"
 
-# 输出目录
-OUTPUT_DIR = "/Users/chtw/codes/iweaver/BabelDOC/output/pipeline2"
+INPUT_PDF = "/Users/chtw/Downloads/待翻译文件示例 (1).pdf"
 
 # 语言设置
 LANG_IN = "en"
-LANG_OUT = "cn"
+# LANG_OUT = "cn"
+LANG_OUT = "ru"
+
+# 输出目录
+OUTPUT_DIR = f"/Users/chtw/codes/iweaver/BabelDOC/output/pipeline3-{LANG_IN}-{LANG_OUT}"
+
 
 
 api_key = os.getenv("OPENAI_API_KEY")
@@ -31,7 +35,7 @@ api_key = os.getenv("OPENAI_API_KEY")
 # API配置 - 翻译模型
 TRANSLATORS = [
     {
-        "model_name": "deepseek-ai/DeepSeek-V3.2-Exp",
+        "model_name": "deepseek-ai/DeepSeek-V3.2-Think",
         "base_url": "https://api.modelverse.cn/v1/",
         "api_key": api_key,
     },
@@ -41,17 +45,17 @@ TRANSLATORS = [
 # API配置 - 润色模型 (可选，留空则跳过润色阶段)
 POLISHERS = [
     {
-        "model_name": "gemini-2.5-flash",
+        "model_name": "deepseek-ai/DeepSeek-V3.2",
         "base_url": "https://api.modelverse.cn/v1/",
-        "api_key": api_key
+        "api_key": api_key,
     },
 ]
 
 # API配置 - 评估模型 (可选，留空则跳过评估阶段)
 EVALUATORS = [
     {
-        "model_name": "gemini-2.5-flash",
-        "base_url": "https://api.modelverse.cn/v1/",
+        "model_name": "deepseek-chat",
+        "base_url": "https://api.deepseek.com/v1",
         "api_key": api_key
     },
 ]
@@ -267,7 +271,7 @@ def main():
         print(f"  过程数据: {json_path}")
 
         # 生成评估报告
-        report_path = pipeline_translator.generate_report()
+        report_path = pipeline_translator.generate_report(original_filename=input_path.name)
         print(f"  评估报告: {report_path}")
 
         # 显示统计信息

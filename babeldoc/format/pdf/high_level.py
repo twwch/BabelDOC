@@ -76,8 +76,9 @@ TRANSLATE_STAGES = [
     # (RemoveDescent.stage_name, 0.15),  # Remove Char Descent
     (AutomaticTermExtractor.stage_name, 30.0),  # Extract Terms
     (ILTranslator.stage_name, 46.96),  # Translate Paragraphs
-    ("Polish Translations", 15.0),  # Pipeline: Polish Translations
-    ("Evaluate Translations", 15.0),  # Pipeline: Evaluate Translations
+    ("Initial Evaluation", 5.0),  # Pipeline: Initial Evaluation
+    ("Optimize Translations", 15.0),  # Pipeline: Optimize Translations (Polish)
+    ("Comparative Evaluation", 10.0),  # Pipeline: Comparative Evaluation
     (Typesetting.stage_name, 4.71),  # Typesetting
     (FontMapper.stage_name, 0.61),  # Add Fonts
     (PDFCreater.stage_name, 1.96),  # Generate drawing instructions
